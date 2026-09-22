@@ -56,47 +56,54 @@ jobs:
       - name: 🏗️ Build frontend assets
         run: npm run build:frontend
 
-      - name: 📝 Create wrangler.toml
+      # 配置的唯一来源是仓库根目录的 wrangler.toml（上游维护，随每日同步自动更新）。
+      # 这样上游新增绑定 / 定时任务 / 兼容性设置会被自动继承；
+      # 本文件只负责注入 CI 专属的两项：D1 库 ID、面板登录口令。
+      - name: 📝 准备 wrangler.toml
+        env:
+          D1_ID: ${{ secrets.D1_DATABASE_ID }}
+          PANEL_SECRET: ${{ secrets.API_SECRET }}
         run: |
-          cat > wrangler.toml << 'WEOF'
-          name = "cf-server-monitor"
-          main = "src/index.js"
-          compatibility_date = "2024-12-01"
-          compatibility_flags = ["nodejs_compat"]
-          keep_vars = true
+          [ -f wrangler.toml ] || { echo "❌ 仓库根目录没有 wrangler.toml"; exit 1; }
+          [ -n "${D1_ID:-}" ] || { echo "❌ 缺少 repo secret: D1_DATABASE_ID"; exit 1; }
+          [ -n "${PANEL_SECRET:-}" ] || { echo "❌ 缺少 repo secret: API_SECRET"; exit 1; }
 
-          # 定时任务配置（UTC）
-          # - 每分钟：执行离线节点检测
-          # - 每小时：合并执行其他定时任务（每月1号数据清理、每月8号清理旧表、每天12点服务器到期检测）
-          [triggers]
-          crons = ["*/1 * * * *", "0 * * * *"]
+          # 1) worker 名对齐线上（l-l.eu.cc 的路由绑在这个 worker 上）
+          #    只改第一处 name =，避免误伤 [[durable_objects.bindings]] 里的 name
+          sed -i '0,/^name *=/s|^name *=.*|name = "cf-server-monitor"|' wrangler.toml
 
-          [assets]
-          directory = "./dist"
-          binding = "ASSETS"
+          # 2) 补 keep_vars = true（缺了会把线上已有的其它变量清掉）
+          if ! grep -q '^keep_vars *= *true' wrangler.toml; then
+            sed -i '0,/^compatibility_flags *=/s|^\(compatibility_flags *=.*\)$|\1\nkeep_vars = true|' wrangler.toml
+          fi
 
-          [[d1_databases]]
-          binding = "DB"
-          database_name = "server-monitor-db"
-          database_id = "D1_PLACEHOLDER"
+          # 3) 注入 D1 库 ID（仓库文件供本地测试，不含线上库 ID）
+          if grep -q '^database_id' wrangler.toml; then
+            sed -i "s|^database_id *=.*|database_id = \"${D1_ID}\"|" wrangler.toml
+          else
+            sed -i "/^database_name = \"server-monitor-db\"$/a database_id = \"${D1_ID}\"" wrangler.toml
+          fi
 
-          # Durable Objects：实时指标广播中心
-          [[durable_objects.bindings]]
-          name = "METRICS_BROADCASTER"
-          class_name = "MetricsBroadcaster"
+          # 4) 注入面板登录口令（幂等；上游若自带 [vars] 就写进那一节，避免 TOML 重复表）
+          if grep -q '^\[vars\]' wrangler.toml; then
+            if grep -q '^API_SECRET' wrangler.toml; then
+              sed -i "s|^API_SECRET *=.*|API_SECRET = \"${PANEL_SECRET}\"|" wrangler.toml
+            else
+              sed -i "/^\[vars\]/a API_SECRET = \"${PANEL_SECRET}\"" wrangler.toml
+            fi
+          else
+            printf '\n[vars]\nAPI_SECRET = "%s"\n' "${PANEL_SECRET}" >> wrangler.toml
+          fi
 
-          [[migrations]]
-          tag = "v1"
-          new_sqlite_classes = ["MetricsBroadcaster"]
+          # 5) 硬校验：任一项不成立就让本次部署失败，绝不带错配置上线
+          grep -q '^name = "cf-server-monitor"$' wrangler.toml || { echo "❌ worker 名未对齐"; exit 1; }
+          grep -q '^keep_vars *= *true' wrangler.toml || { echo "❌ keep_vars 缺失"; exit 1; }
+          [ "$(grep -c '^database_id' wrangler.toml)" = "1" ] || { echo "❌ database_id 注入异常"; exit 1; }
+          [ "$(grep -c '^API_SECRET' wrangler.toml)" = "1" ] || { echo "❌ API_SECRET 注入异常"; exit 1; }
+          grep -q '^name = "METRICS_BROADCASTER"$' wrangler.toml || { echo "❌ Durable Object 绑定名被改坏"; exit 1; }
 
-          [vars]
-          API_SECRET = "SECRET_PLACEHOLDER"
-          WEOF
-
-          sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
-          sed -i "s|SECRET_PLACEHOLDER|${{ secrets.API_SECRET }}|g" wrangler.toml
-
-          echo "✅ wrangler.toml 已生成"
+          echo "✅ wrangler.toml 已就绪"
+          grep -n '^name =\|^main =\|^keep_vars\|^\[triggers\]\|^crons\|^\[vars\]\|^database_id\|^binding =' wrangler.toml
 
       # wrangler v4 的 `deploy` 会自动根据 wrangler.toml 中的 [[durable_objects.bindings]]
       # 声明创建 DO namespace（幂等：已存在则跳过），无需单独命令。
