@@ -29,6 +29,12 @@ jobs:
           target_sync_branch: main
           target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
 
+          # 【本 fork 的关键配置】上游若改到 .github/workflows/deploy.yml 的同一处，
+          # git 默认会冲突，而本动作在 pull 失败时直接以非 0 退出 → 当天同步中断。
+          # 加 -X ours：冲突一律以本 fork 为准，只影响双方都改过的行，
+          # 上游其余改动照常合入（已用真实 git 实测）。
+          upstream_pull_args: "-X ours"
+
           # Set test_mode true to run tests instead of the true action!!
           test_mode: false
 
